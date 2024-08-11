@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tensorflow as tf
 
 class SELDTCNModel(nn.Module):
     def __init__(self, 
@@ -14,6 +15,11 @@ class SELDTCNModel(nn.Module):
                  flatten_embds = False):
         super(SELDTCNModel, self).__init__()
 
+        assert len(data_in) == 4
+
+        B,C,H,W = data_in
+        print(C)
+
         self.return_embds = return_embds
         self.flatten_embds = flatten_embds
         # Convolutional Layers
@@ -24,9 +30,9 @@ class SELDTCNModel(nn.Module):
         self.dropout_layers = nn.ModuleList()
 
         for i, pool in enumerate(pool_size):
-            self.conv_layers.append(nn.Conv2d(data_in[0] if i == 0 else nb_cnn2d_filt, 
-                                              nb_cnn2d_filt, kernel_size=3, padding=1))
-            self.bn2d_layers.append(nn.BatchNorm2d(nb_cnn2d_filt))
+            self.conv_layers.append(nn.Conv2d(C if i == 0 else nb_cnn2d_filt, 
+                                              nb_cnn2d_filt, kernel_size=(3,3), padding=1))
+            self.bn2d_layers.append(nn.BatchNorm2d(nb_cnn2d_filt,affine=True,eps=0.001,track_running_stats=True,momentum=0.99))
             self.pool_layers.append(nn.MaxPool2d(kernel_size=(pool, 1)))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
@@ -38,12 +44,12 @@ class SELDTCNModel(nn.Module):
             self.tcn_layers.append(nn.Conv1d(nb_cnn2d_filt, 
                                              256, kernel_size=3, padding=2**d, dilation=2**d))
             self.skip_layers.append(nn.Conv1d(256, 128, kernel_size=1, padding=0))
-            self.bn1d_layers.append(nn.BatchNorm1d(256))
+            self.bn1d_layers.append(nn.BatchNorm1d(256,affine=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
         # Final TCN Convolutions
-        self.tcn_conv1 = nn.Conv1d(128, 128, kernel_size=1, padding=0)
-        self.tcn_conv2 = nn.Conv1d(128, 128, kernel_size=1, padding=0)
+        self.tcn_conv1 = nn.Conv1d(128, 128, kernel_size=1, padding= 0)
+        self.tcn_conv2 = nn.Conv1d(128, 128, kernel_size=1, padding= 0)
         
         # SED Layers
         self.sed_layers = nn.ModuleList()
@@ -78,6 +84,8 @@ class SELDTCNModel(nn.Module):
             x = F.relu(bn(conv(x)))
             x = pool(x)
             x = drop(x)
+
+        x = torch.permute(x,(0,1,3,2))
         
         # Permute and Reshape
         x = x.reshape(x.size(0), x.size(1), -1)
@@ -96,7 +104,8 @@ class SELDTCNModel(nn.Module):
             skip_connections.append(skip_out)
         
         # Sum of Skip Connections
-        x = sum(skip_connections)
+        skip_connections = torch.stack(skip_connections)
+        x = torch.sum(skip_connections,dim=0)
         x = F.relu(x)
 
         q = self.Q_conv[0](x)
@@ -142,10 +151,10 @@ if __name__ == "__main__":
     # Example usage
     data_in = (1, 1, 60, 94)  # Example input shape
     data_out = (None, 94, 2)  # Example output shape
-    dropout_rate = 0.3
+    dropout_rate = 0.5
     nb_cnn2d_filt = 128
     pool_size = [4, 3, 3]
-    fnn_size = [64, 64]
+    fnn_size = [65]
 
     model = SELDTCNModel(data_in, 
                          data_out, 
@@ -153,14 +162,60 @@ if __name__ == "__main__":
                          nb_cnn2d_filt, 
                          pool_size, 
                          fnn_size,
-                         return_embds = True,
-                         flatten_embds = True)
+                         return_embds = False,
+                         flatten_embds = False)
 
     sample_data = torch.rand((1,1,60,94))
 
+    print(sum(p.numel() for p in model.bn2d_layers[0].parameters()))
+
     total_params = sum(p.numel() for p in model.parameters())
     print(model(sample_data).shape)
-    print(total_params)
+    print("TOTAL PARAMS: ",total_params)
+
+
+
+
+    # onnx_model_path = "tcn_model.onnx"
+    # dummy_input = torch.randn((1,1,60,94))
+    # torch.onnx.export(
+    #     model,                 # model being run
+    #     dummy_input,                   # model input (or a tuple for multiple inputs)
+    #     onnx_model_path,               # where to save the model (can be a file or file-like object)
+    #     export_params=True,            # store the trained parameter weights inside the model file
+    #     opset_version=12,              # the ONNX version to export the model to
+    #     do_constant_folding=False,      # whether to execute constant folding for optimization
+    #     input_names=['input'],         # the model's input names
+    #     output_names=['output'],       # the model's output names
+    #     dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}  # variable length axes
+    # )
+
+
+    # Load the ONNX model
+    # onnx_model = onnx.load("tcn_model.onnx")
+
+    # # Convert ONNX model to TensorFlow
+    # tf_rep = prepare(onnx_model)
+    # tf_model_path = "simple_model_tf"
+    # tf_rep.export_graph(tf_model_path)
+
+    # loaded_model = tf.saved_model.load(tf_model_path)
+
+    # converter = tf.lite.TFLiteConverter.from_saved_model(tf_model_path)
+    # tflite_model = converter.convert()
+    # open("converted_model.tflite", "wb").write(tflite_model)
+
+
+    # run_model = tf.function(lambda x: loaded_model.signatures["serving_default"](x)['output'])
+
+    # input_shape = (1,1,60,94)
+
+    # concrete_fn = run_model.get_concrete_function(
+    #     tf.TensorSpec(input_shape,tf.float32)
+    # )
+
+    # loaded_model.signatures["serving_default"].save('./',save_format = 'tf',signatures = concrete_fn)
+
 
     # pytorch_module = model.eval()
 
@@ -171,4 +226,4 @@ if __name__ == "__main__":
     #     outputs_channel_order=ChannelOrder.TENSORFLOW
     # )
 
-    # print(total_params - keras_model.count_params())
+    # print(keras_model.count_params())
